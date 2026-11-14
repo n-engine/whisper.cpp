@@ -1485,7 +1485,7 @@ static vk_xe_fa_tuning_params get_xe_fa_tuning_params(const vk_device_struct * d
         bool k_in_shmem = hsk <= 576u;
         bool v_in_shmem = hsk <= 128u && hsv <= 128u;
         bool emf_in_shmem = wg_row / matrix_mnk[1] != sg_per_gw;
-        bool mask_in_shmem = mask_row <= 64;
+        bool mask_in_shmem = !pipeline_state.no_mask && mask_row <= 64;
         size_t shmem_q_sz = q_in_shmem * wg_row * sizeof(ggml_fp16_t);
         size_t shmem_oob_staging_sz = sg_per_gw * tm * tk * sizeof(ggml_fp16_t);
         size_t shmem_mask_sz = mask_in_shmem ? (mask_row * p_per_iter * sizeof(ggml_fp16_t)) : 0;
@@ -1524,6 +1524,10 @@ static vk_xe_fa_tuning_params get_xe_fa_tuning_params(const vk_device_struct * d
 
         if (intel_gpu) {
             pipeline_flag |= 1 << 3;
+        }
+
+        if (pipeline_state.no_mask) {
+            pipeline_flag |= 1 << 4;
         }
 
         params.workgroup_size = { wg_sz };
@@ -8655,11 +8659,13 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     auto vk_dev = ctx->device.get();
     bool xe_fa_opt = false;
     bool xe_fa_use_2phases = false;
+    // the prefill kernel handles a missing mask, the decode kernels do not
+    const bool xe_fa_prefill = neq1 > 8 || uint32_t(neq2 / nev2) > 64;
     bool xe_fa_supported_platform = vk_dev->xe_fa_support && vk_dev->properties.deviceID != 0xFD80 && vk_dev->properties.deviceID != 0xFD81;
-    bool xe_fa_supported_usage = neq0 % 32 == 0 && nev0 % 16 == 0 && mask != nullptr && !use_sparse && max_bias == 0.0f && logit_softcap == 0.0f &&
+    bool xe_fa_supported_usage = neq0 % 32 == 0 && nev0 % 16 == 0 && (mask != nullptr || xe_fa_prefill) && !use_sparse && max_bias == 0.0f && logit_softcap == 0.0f &&
                                  tensor_aligned_with(k, 16u) && tensor_aligned_with(v, 16u);
     bool xe_fa_supported_dtype = q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16 &&
-                                 mask != nullptr && mask->type == GGML_TYPE_F16;
+                                 (mask == nullptr || mask->type == GGML_TYPE_F16);
     xe_fa_opt = xe_fa_supported_platform && xe_fa_supported_usage && xe_fa_supported_dtype;
     std::pair<vk_pipeline, vk_pipeline> xe_fa_pipeline_dual_phases = { nullptr , nullptr };
     vk_pipeline xe_fa_pipeline = nullptr;
@@ -8673,14 +8679,15 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     {
         std::lock_guard<std::mutex> guard(ctx->device->compile_mutex);
         if (xe_fa_opt) {
-            if (neq1 > 8 || pv_ratio > 64) {
+            if (xe_fa_prefill) {
                 uint32_t head_stride_q = uint32_t(nbq2 / ggml_type_size(q->type));
                 uint32_t batch_stride_q = uint32_t(nbq3 / ggml_type_size(q->type));
-                vk_xe_fa_pipeline_state prefill_state = { (uint32_t)neq0, (uint32_t)nev0, qk_ratio, pv_ratio, 0, false, false, false, false };
+                vk_xe_fa_pipeline_state prefill_state = { (uint32_t)neq0, (uint32_t)nev0, qk_ratio, pv_ratio, 0, false, false, false, false, false };
                 prefill_state.unaligned_seq_len = nek1 % 32 != 0;
                 prefill_state.unaligned_q = head_stride_q % 8 != 0 || q_stride % 8 != 0 || batch_stride_q % 8 != 0;
-                prefill_state.partial_row_mask = neq1 > nem1;
+                prefill_state.partial_row_mask = mask != nullptr && neq1 > nem1;
                 prefill_state.multi_head_mask = nem2 > 1;
+                prefill_state.no_mask = mask == nullptr;
                 xe_fa_params = get_xe_fa_tuning_params(vk_dev, prefill_state, true);
                 if (xe_fa_params.shmem_sz <= vk_dev->properties.limits.maxComputeSharedMemorySize) {
                     auto& xe_fa_pipelines = ctx->device->pipeline_xe_fa_prefill;
@@ -8694,7 +8701,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
                     xe_fa_opt = false;
                 }
             } else {
-                vk_xe_fa_pipeline_state decode_state = { (uint32_t)neq0, (uint32_t)nev0, qk_ratio, pv_ratio, (uint32_t)neq1, false, false, false, false };
+                vk_xe_fa_pipeline_state decode_state = { (uint32_t)neq0, (uint32_t)nev0, qk_ratio, pv_ratio, (uint32_t)neq1, false, false, false, false, false };
                 decode_state.unaligned_seq_len = nek1 % 256 != 0;
                 xe_fa_params = get_xe_fa_tuning_params(vk_dev, decode_state, false);
                 const uint32_t split_p_size = xe_fa_params.decode_params.p_chunk_ph1;
@@ -9000,7 +9007,8 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
 
         vk_xe_fa_push_constants pc_xe_fa = { (uint32_t)neq1, (uint32_t)neq2, (uint32_t)neq3,
                                              (uint32_t)nek1, (uint32_t)nek2, (uint32_t)nek3, (uint32_t)nev2, (uint32_t)nev3,
-                                             (uint32_t)nem1, (uint32_t)nem2, (uint32_t)nem3,
+                                             // without a mask the shader never reads it, but still derives offsets with % nem2 / % nem3
+                                             mask ? nem1 : 1u, mask ? nem2 : 1u, mask ? nem3 : 1u,
                                              q_stride, head_stride_q, k_stride, head_stride_k, v_stride, head_stride_v,
                                              batch_stride_q, batch_stride_k, batch_stride_v, batch_stride_o,
                                              (sinks != nullptr) ? (1u << 16) : 0u, scale };

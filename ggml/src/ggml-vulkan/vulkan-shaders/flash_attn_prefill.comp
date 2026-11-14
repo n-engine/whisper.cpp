@@ -72,11 +72,14 @@ layout (constant_id = 14) const uint gqa_fold = 1;
 #define UNALIGNED_Q_STRIDE_BIT (1 << 1)
 #define PARTIAL_ROW_MASK_BIT (1 << 2)
 #define INTEL_GPU_BIT (1 << 3)
+#define NO_MASK_BIT (1 << 4)
 #define SINK_ENABLE_BIT (1 << 16)
 
 const bool aligned_q_stride = (Flags & UNALIGNED_Q_STRIDE_BIT) == 0;
 const bool seq_boundary_check = (Flags & UNALIGNED_SEQ_LEN_BIT) != 0;
 const bool partial_row_mask = (Flags & PARTIAL_ROW_MASK_BIT) != 0;
+// No mask tensor: every mask read below folds to zero, the sequence-boundary handling stays.
+const bool has_mask = (Flags & NO_MASK_BIT) == 0;
 const uint TK = 16;
 const uint sg_count = WorkGroupSize / SubGroupSize;
 const uint matp_count = step_p / TM;
@@ -104,7 +107,7 @@ const uint max_q_reg_staging = shmem_size / 2 / Wr;
 const bool intel_gpu = (Flags & INTEL_GPU_BIT) != 0;
 const bool k_in_shmem = HSK <= 576;
 const bool v_in_shmem = HSK <= 128 && HSV <= 128;
-const bool mask_in_shmem = folded_row_wg <= 64;
+const bool mask_in_shmem = has_mask && folded_row_wg <= 64;
 
 const uint oobsh_staging_size = sg_count * TM * TK;
 const uint qsh_size = Wr * q_shmem;
@@ -228,7 +231,7 @@ void main() {
             m_offset /= 4;
         }
     }
-    const bool mask_row_valid = !partial_row_mask || mask_in_boundary;
+    const bool mask_row_valid = has_mask && (!partial_row_mask || mask_in_boundary);
     const uint o_offset = (batch_idx * p.nb3 + out_r * folded_row_wg * o_dim + (head_q_idx * gqa_fold + sg_o_r_h) * HSV +
                            sg_o_r_row * TN * o_dim + sg_o_c * Bc + lane_c * o_dim) / 4 + lane_r;
     const uint vsh_offset = sg_v_c * TK * HSV + sg_v_r * TM * TK + vsh_base;
@@ -514,13 +517,15 @@ void main() {
                 if (seq_boundary_check) {
                     [[unroll]] for (uint idx = 0; idx < softmax_loops; ++idx) {
                         if (loop * step_p + idx + lane_r * softmax_loops < p.nek1) {
-                            Pf[idx] += mask_row_valid ? float(data_m[m_offset + idx]) : 0.0f;
+                            if (has_mask) {
+                                Pf[idx] += mask_row_valid ? float(data_m[m_offset + idx]) : 0.0f;
+                            }
                         } else {
                             Pf[idx] += NEG_FLT_MAX_OVER_2;
                         }
                     }
                     m_offset += step_p;
-                } else {
+                } else if (has_mask) {
                     [[unroll]] for (uint idx = 0; idx < softmax_loops / 4; ++idx) {
                         f16vec4 mv4_temp = mask_row_valid ? data_mv4[m_offset + idx] : f16vec4(0.0f, 0.0f, 0.0f, 0.0f);
                         float mask_f_temp[4] = float[4](float(mv4_temp.x), float(mv4_temp.y), float(mv4_temp.z), float(mv4_temp.w));
